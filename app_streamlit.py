@@ -1,4 +1,5 @@
 import io
+from pathlib import Path
 import numpy as np
 import pandas as pd
 import plotly.express as px
@@ -50,9 +51,23 @@ S3_MAP = {
 }
 
 # ==================== Helpers ====================
+def resolve_path(p: str) -> str:
+    """
+    Try the provided path; if it doesn't exist, try the same filename
+    in repo root and in data/ . Returns a string path (may not exist).
+    """
+    cand = Path(p)
+    if cand.exists():
+        return str(cand)
+    name = Path(p).name
+    for alt in [Path(name), Path("data") / name]:
+        if alt.exists():
+            return str(alt)
+    return str(cand)
+
 @st.cache_data
 def load_and_standardize(path: str, colmap: dict, is_ec2: bool):
-    df = pd.read_csv(path)
+    df = pd.read_csv(resolve_path(path))
     df = df.rename(columns={k: v for k, v in colmap.items() if k in df.columns})
     if is_ec2:
         for c in ["CPUUtilization","MemoryUtilization","NetworkIn_Bps","NetworkOut_Bps","CostPerHourUSD"]:
@@ -74,29 +89,19 @@ def format_dollars(x):
 def apply_filters(ec2: pd.DataFrame, s3: pd.DataFrame,
                   ec2_regions, s3_regions, itypes, sclasses,
                   ec2_cost_range, s3_cost_range):
-    e = ec2.copy()
-    s = s3.copy()
-    if "Region" in e.columns and ec2_regions:
-        e = e[e["Region"].isin(ec2_regions)]
-    if "InstanceType" in e.columns and itypes:
-        e = e[e["InstanceType"].isin(itypes)]
+    e = ec2.copy(); s = s3.copy()
+    if "Region" in e.columns and ec2_regions: e = e[e["Region"].isin(ec2_regions)]
+    if "InstanceType" in e.columns and itypes: e = e[e["InstanceType"].isin(itypes)]
     if ec2_cost_range and "CostPerHourUSD" in e.columns:
-        lo, hi = ec2_cost_range
-        e = e[(e["CostPerHourUSD"] >= lo) & (e["CostPerHourUSD"] <= hi)]
-
-    if "Region" in s.columns and s3_regions:
-        s = s[s["Region"].isin(s3_regions)]
-    if "StorageClass" in s.columns and sclasses:
-        s = s[s["StorageClass"].isin(sclasses)]
+        lo, hi = ec2_cost_range; e = e[(e["CostPerHourUSD"] >= lo) & (e["CostPerHourUSD"] <= hi)]
+    if "Region" in s.columns and s3_regions: s = s[s["Region"].isin(s3_regions)]
+    if "StorageClass" in s.columns and sclasses: s = s[s["StorageClass"].isin(sclasses)]
     if s3_cost_range and "MonthlyCostUSD" in s.columns:
-        lo2, hi2 = s3_cost_range
-        s = s[(s["MonthlyCostUSD"] >= lo2) & (s["MonthlyCostUSD"] <= hi2)]
-
+        lo2, hi2 = s3_cost_range; s = s[(s["MonthlyCostUSD"] >= lo2) & (s["MonthlyCostUSD"] <= hi2)]
     return e, s
 
 def only_underutilized_ec2(df: pd.DataFrame, threshold=20.0) -> pd.DataFrame:
-    if "CPUUtilization" not in df.columns:
-        return df.iloc[0:0].copy()
+    if "CPUUtilization" not in df.columns: return df.iloc[0:0].copy()
     return df[df["CPUUtilization"] < threshold].copy()
 
 def find_utilization_percent_column(df: pd.DataFrame):
@@ -105,20 +110,16 @@ def find_utilization_percent_column(df: pd.DataFrame):
     return candidates[0] if candidates else None
 
 def s3_underutilized_20pct(df: pd.DataFrame) -> pd.DataFrame:
-    if df.empty:
-        return df
+    if df.empty: return df
     col = find_utilization_percent_column(df)
     d = df.copy()
     if col:
         util = pd.to_numeric(d[col], errors="coerce")
-        if util.dropna().between(0, 1).mean() > 0.6:
-            util = util * 100.0
+        if util.dropna().between(0, 1).mean() > 0.6: util = util * 100.0
         d["UtilizationPercent"] = util
     else:
-        if "TotalSizeGB" not in d.columns:
-            return d.iloc[0:0].copy()
-        if "Region" not in d.columns:
-            d["Region"] = "ALL"
+        if "TotalSizeGB" not in d.columns: return d.iloc[0:0].copy()
+        if "Region" not in d.columns: d["Region"] = "ALL"
         p95 = d.groupby("Region")["TotalSizeGB"].quantile(0.95).rename("SizeP95").reset_index()
         d = d.merge(p95, on="Region", how="left")
         d["UtilizationPercent"] = np.where(d["SizeP95"] > 0, (d["TotalSizeGB"] / d["SizeP95"]) * 100.0, 0.0)
@@ -126,50 +127,35 @@ def s3_underutilized_20pct(df: pd.DataFrame) -> pd.DataFrame:
 
 def build_recommendations(ec2_under: pd.DataFrame, s3_under: pd.DataFrame) -> pd.DataFrame:
     rows = []
-    # EC2: recommend terminate/stop or right-size
     for _, r in ec2_under.iterrows():
-        iid = r.get("InstanceId", "unknown")
-        reg = r.get("Region", "unknown")
-        it  = r.get("InstanceType", "unknown")
-        cpu = r.get("CPUUtilization", np.nan)
-        cph = r.get("CostPerHourUSD", 0.0)
-        save = cph * 730.0
+        iid = r.get("InstanceId", "unknown"); reg = r.get("Region", "unknown")
+        it  = r.get("InstanceType", "unknown"); cpu = r.get("CPUUtilization", np.nan)
+        cph = r.get("CostPerHourUSD", 0.0); save = cph * 730.0
         action = "Terminate / schedule stop" if pd.notna(cpu) and cpu < 10 else "Right-size to smaller family"
-        rows.append({
-            "Resource": "EC2",
-            "IdOrName": str(iid),
-            "Region": reg,
-            "Details": f"{it}, CPU {cpu:.2f}%, ${cph:.3f}/hr",
-            "Recommendation": f"{action}; reclaim ~{format_dollars(save)} per month",
-            "MonthlySavingUSD": round(save, 2),
-        })
-    # S3: recommend lifecycle + delete noncurrent or remove bucket
+        rows.append({"Resource":"EC2","IdOrName":str(iid),"Region":reg,
+                     "Details":f"{it}, CPU {cpu:.2f}%, ${cph:.3f}/hr",
+                     "Recommendation":f"{action}; reclaim ~{format_dollars(save)} per month",
+                     "MonthlySavingUSD":round(save,2)})
     for _, r in s3_under.iterrows():
-        b  = r.get("BucketName", "unknown")
-        reg = r.get("Region", "unknown")
-        sc = r.get("StorageClass", "unknown")
-        util = r.get("UtilizationPercent", np.nan)
+        b = r.get("BucketName","unknown"); reg = r.get("Region","unknown")
+        sc = r.get("StorageClass","unknown"); util = r.get("UtilizationPercent", np.nan)
         cost = r.get("MonthlyCostUSD", 0.0)
-        if str(sc).upper() == "STANDARD":
-            reco = "Move cold objects to IA/Glacier, enable lifecycle & expire noncurrent versions"
-        else:
-            reco = "Review retention; move to cheaper class; expire noncurrent versions"
-        rows.append({
-            "Resource": "S3",
-            "IdOrName": str(b),
-            "Region": reg,
-            "Details": f"{sc}, Util {util:.2f}%, Cost/mo {format_dollars(cost)}",
-            "Recommendation": f"{reco}; reclaim ~{format_dollars(cost)} per month (if eliminated)",
-            "MonthlySavingUSD": round(float(cost), 2),
-        })
+        reco = ("Move cold objects to IA/Glacier, enable lifecycle & expire noncurrent versions"
+                if str(sc).upper() == "STANDARD"
+                else "Review retention; move to cheaper class; expire noncurrent versions")
+        rows.append({"Resource":"S3","IdOrName":str(b),"Region":reg,
+                     "Details":f"{sc}, Util {util:.2f}%, Cost/mo {format_dollars(cost)}",
+                     "Recommendation":f"{reco}; reclaim ~{format_dollars(cost)} per month (if eliminated)",
+                     "MonthlySavingUSD":round(float(cost),2)})
     return pd.DataFrame(rows)
 
 # ==================== Sidebar (paths & filters) ====================
 with st.sidebar:
     st.header("Data Sources")
-    ec2_path = st.text_input("EC2 CSV path", "data/ec2.csv")
-    s3_path  = st.text_input("S3 CSV path",  "data/s3.csv")
-    st.caption("Place your files in /data or paste full paths.")
+    # Default to root filenames; app will also auto-find them in data/
+    ec2_path = st.text_input("EC2 CSV path", "ec2.csv")
+    s3_path  = st.text_input("S3 CSV path",  "s3.csv")
+    st.caption("Place files beside this app (ec2.csv, s3.csv) or in /data. The app will find them.")
 
 # Load
 try:
@@ -181,7 +167,8 @@ except Exception as e:
 
 # Basic cleaning
 ec2 = ec2_raw.fillna({"InstanceType":"Unknown","Region":"Unknown","Tags":"Unknown"})
-s3  = s3_raw.fillna({"StorageClass":"Unknown","Region":"Unknown","Encryption":"Unknown","VersioningEnabled":"Unknown"})
+s3  = s3_raw.fillna({"StorageClass":"Unknown","Region":"Unknown",
+                     "Encryption":"Unknown","VersioningEnabled":"Unknown"})
 
 # Sidebar filters
 with st.sidebar:
@@ -356,10 +343,8 @@ with tab_opt:
     if rec_df.empty:
         st.info("No recommendations — no under-utilized resources matched the 20% rules.")
     else:
-        # Bulleted summary
-        bullets = []
-        for _, r in rec_df.iterrows():
-            bullets.append(f"- **{r['Resource']}** {r['IdOrName']} ({r['Region']}): {r['Recommendation']}")
+        bullets = [f"- **{r['Resource']}** {r['IdOrName']} ({r['Region']}): {r['Recommendation']}"
+                   for _, r in rec_df.iterrows()]
         st.markdown("\n".join(bullets))
         st.markdown("### Recommendation Table")
         st.dataframe(rec_df, use_container_width=True)
@@ -375,33 +360,20 @@ with tab_downloads:
     st.subheader("Exports")
     ec2_u = only_underutilized_ec2(ec2_f, 20.0)
     if not ec2_u.empty and "CostPerHourUSD" in ec2_u.columns:
-        tmp = ec2_u.copy()
-        tmp["SavingPerMonthUSD"] = tmp["CostPerHourUSD"] * 730.0
-        st.download_button(
-            "Download EC2 under-utilized (CPU<20%)",
-            tmp.to_csv(index=False).encode("utf-8"),
-            file_name="ec2_underutilized.csv",
-            mime="text/csv",
-        )
+        tmp = ec2_u.copy(); tmp["SavingPerMonthUSD"] = tmp["CostPerHourUSD"] * 730.0
+        st.download_button("Download EC2 under-utilized (CPU<20%)",
+                           tmp.to_csv(index=False).encode("utf-8"),
+                           file_name="ec2_underutilized.csv", mime="text/csv")
     s3_u = s3_underutilized_20pct(s3_f)
     if not s3_u.empty and "MonthlyCostUSD" in s3_u.columns:
-        tmp2 = s3_u.copy()
-        tmp2["SavingPerMonthUSD"] = tmp2["MonthlyCostUSD"]
-        st.download_button(
-            "Download S3 under-utilized (<20% utilization)",
-            tmp2.to_csv(index=False).encode("utf-8"),
-            file_name="s3_underutilized.csv",
-            mime="text/csv",
-        )
-    # Download recommendations also here for convenience
+        tmp2 = s3_u.copy(); tmp2["SavingPerMonthUSD"] = tmp2["MonthlyCostUSD"]
+        st.download_button("Download S3 under-utilized (<20% utilization)",
+                           tmp2.to_csv(index=False).encode("utf-8"),
+                           file_name="s3_underutilized.csv", mime="text/csv")
     if 'rec_df' in locals() and not rec_df.empty:
-        st.download_button(
-            "Download all recommendations (CSV)",
-            rec_df.to_csv(index=False).encode("utf-8"),
-            file_name="recommendations.csv",
-            mime="text/csv",
-        )
-    # Full filtered
+        st.download_button("Download all recommendations (CSV)",
+                           rec_df.to_csv(index=False).encode("utf-8"),
+                           file_name="recommendations.csv", mime="text/csv")
     st.download_button("Download EC2 (filtered)", ec2_f.to_csv(index=False).encode("utf-8"),
                        file_name="ec2_filtered.csv", mime="text/csv")
     st.download_button("Download S3 (filtered)", s3_f.to_csv(index=False).encode("utf-8"),
